@@ -1,11 +1,13 @@
 """FastAPI 入口：临时限行核验 HTTP API。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Path, Request
+from fastapi import FastAPI, Header, Path, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg.errors import CheckViolation
@@ -19,6 +21,7 @@ from .repository import (
     BatchRegionsNotFound,
     BatchRevisionConflict,
     BatchUnsafeTrajectories,
+    IdempotencyKeyConflict,
     PassConflict,
     PassUnsafe,
 )
@@ -52,8 +55,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.3.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更。",
+    version="1.4.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
     lifespan=lifespan,
 )
 
@@ -67,6 +70,53 @@ class DomainError(Exception):
         super().__init__(message)
         self.message = message
         self.loc = loc or []
+
+
+class InvalidIdempotencyKey(Exception):
+    """幂等键本身非法（空键或超过 128 字符，HTTP 422）。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+IDEMPOTENCY_KEY_MAX_LEN = 128
+
+
+def _normalize_idempotency_key(raw: str | None) -> str | None:
+    """校验 Idempotency-Key 头：非空且最长 128 字符；未携带返回 None（既有行为）。"""
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise InvalidIdempotencyKey("幂等键不能为空（Idempotency-Key 头需为非空字符串）")
+    if len(raw) > IDEMPOTENCY_KEY_MAX_LEN:
+        raise InvalidIdempotencyKey(
+            f"幂等键最长 {IDEMPOTENCY_KEY_MAX_LEN} 字符（当前 {len(raw)} 字符）"
+        )
+    return raw
+
+
+def _request_fingerprint(operation: str, target, payload) -> str:
+    """以操作类型、目标区域与规范化请求内容判定「同一次请求」。
+
+    payload 一律取 Pydantic 校验归一化后的 model_dump(mode="json")：
+    时刻已归一化为 UTC、多边形已归一化为逆时针闭合环、数值统一为浮点，
+    因此语义相同的请求（即使 JSON 键序或时区写法不同）得到同一指纹。
+    """
+    canonical = json.dumps(
+        {"operation": operation, "target": target, "payload": payload},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _raw_json_response(body: str, status_code: int) -> Response:
+    """按 JSON 原文返回响应。
+
+    带键请求首次提交与其重试回放共用同一串响应原文（入库的就是它），
+    保证重试逐字节返回原响应。
+    """
+    return Response(content=body, media_type="application/json", status_code=status_code)
 
 
 def _error_response(status: int, code: str, message: str, details=None) -> JSONResponse:
@@ -160,6 +210,27 @@ async def _on_http_exception(_request: Request, exc: StarletteHTTPException):
 async def _on_domain_error(_request: Request, exc: DomainError):
     details = [{"loc": exc.loc, "message": exc.message}] if exc.loc else []
     return _error_response(422, "invalid_input", exc.message, details)
+
+
+@app.exception_handler(InvalidIdempotencyKey)
+async def _on_invalid_idempotency_key(_request: Request, exc: InvalidIdempotencyKey):
+    return _error_response(
+        422,
+        "invalid_idempotency_key",
+        exc.message,
+        [{"loc": ["header", "Idempotency-Key"], "message": exc.message}],
+    )
+
+
+@app.exception_handler(IdempotencyKeyConflict)
+async def _on_idempotency_key_conflict(_request: Request, exc: IdempotencyKeyConflict):
+    return _error_response(
+        409,
+        "idempotency_key_conflict",
+        str(exc),
+        [{"loc": ["header", "Idempotency-Key"],
+          "message": "该幂等键已绑定另一份内容不同的请求（操作类型/目标区域/请求内容不一致）"}],
+    )
 
 
 @app.exception_handler(geometry.RegionError)
@@ -278,21 +349,56 @@ async def _on_pass_conflict(_request: Request, exc: PassConflict):
 
 @app.post("/api/regions", response_model=RegionCreatedResponse, status_code=201,
           tags=["regions"])
-def create_region(payload: RegionCreate):
-    """登记一个限行区域；非法多边形或不递增时段返回 422 且不保存。"""
+def create_region(payload: RegionCreate,
+                  idempotency_key: str | None = Header(
+                      default=None,
+                      description="幂等键：非空、最长 128 字符；"
+                                  "同键同内容重试返回原响应，同键不同内容 409",
+                  )):
+    """登记一个限行区域；非法多边形或不递增时段返回 422 且不保存。
+
+    携带 `Idempotency-Key` 请求头时启用幂等重试：首次成功提交后，相同键 +
+    相同请求内容的重试直接返回原状态与原响应，不重复登记。
+    """
+    key = _normalize_idempotency_key(idempotency_key)
     try:
         payload.validate_time_order()
     except ValueError as exc:
         raise DomainError(str(exc), ["valid_from", "valid_to"]) from exc
+    fingerprint = (
+        _request_fingerprint("create", None, payload.model_dump(mode="json"))
+        if key is not None else None
+    )
     with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
         with conn.cursor() as cur:
             repository.configure_cursor(cur)
             try:
+                if key is not None:
+                    replay = repository.idempotency_claim(cur, key, fingerprint)
+                    if replay is not None:
+                        conn.rollback()  # 只读回放，不产生任何变更
+                        return _raw_json_response(replay["response_body"],
+                                                  replay["status_code"])
                 region, revision = repository.create_region(cur, payload, payload.polygon)
+                response = RegionCreatedResponse(
+                    region=RegionOut.model_validate(region), revision=revision
+                )
+                if key is not None:
+                    # 响应原文与业务变更同事务落库；此后同键重试只回放、不再变更
+                    body = response.model_dump_json()
+                    repository.idempotency_store(cur, key, 201, body)
             except CheckViolation as exc:
+                conn.rollback()
                 raise DomainError("生效时段必须满足 valid_from < valid_to（左闭右开）") from exc
-        conn.commit()
-    return RegionCreatedResponse(region=RegionOut.model_validate(region), revision=revision)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    if key is not None:
+        return _raw_json_response(body, 201)
+    return response
 
 
 @app.get("/api/regions", response_model=list[RegionOut], tags=["regions"])
@@ -323,38 +429,108 @@ def get_region(region_id: int = Path(ge=1)):
 
 
 @app.patch("/api/regions/{region_id}", response_model=RegionCreatedResponse, tags=["regions"])
-def update_region(payload: RegionUpdate, region_id: int = Path(ge=1)):
-    """修订区域（部分更新）；每次修订 version 加 1 并推进全局 revision。"""
+def update_region(payload: RegionUpdate, region_id: int = Path(ge=1),
+                  idempotency_key: str | None = Header(
+                      default=None,
+                      description="幂等键：非空、最长 128 字符；"
+                                  "同键同内容重试返回原响应，同键不同内容 409",
+                  )):
+    """修订区域（部分更新）；每次修订 version 加 1 并推进全局 revision。
+
+    携带 `Idempotency-Key` 时，同键同内容重试返回首次修订的原响应，
+    version/revision 不会再次推进。
+    """
+    key = _normalize_idempotency_key(idempotency_key)
+    fingerprint = (
+        _request_fingerprint("update", region_id, payload.model_dump(mode="json"))
+        if key is not None else None
+    )
     with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
         with conn.cursor() as cur:
             repository.configure_cursor(cur)
             try:
+                if key is not None:
+                    replay = repository.idempotency_claim(cur, key, fingerprint)
+                    if replay is not None:
+                        conn.rollback()  # 只读回放，不产生任何变更
+                        return _raw_json_response(replay["response_body"],
+                                                  replay["status_code"])
                 result = repository.update_region(
                     cur, region_id, payload, payload.polygon
                 )
+                if result is None:
+                    conn.rollback()
+                    raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                                           "message": f"区域 {region_id} 不存在"}})
+                region, revision = result
+                response = RegionCreatedResponse(
+                    region=RegionOut.model_validate(region), revision=revision
+                )
+                if key is not None:
+                    body = response.model_dump_json()
+                    repository.idempotency_store(cur, key, 200, body)
             except ValueError as exc:
+                conn.rollback()
                 raise DomainError(str(exc), ["valid_from", "valid_to"]) from exc
             except CheckViolation as exc:
+                conn.rollback()
                 raise DomainError("生效时段必须满足 valid_from < valid_to（左闭右开）") from exc
-            if result is None:
-                raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
-                                                                       "message": f"区域 {region_id} 不存在"}})
-            region, revision = result
-        conn.commit()
-    return RegionCreatedResponse(region=RegionOut.model_validate(region), revision=revision)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    if key is not None:
+        return _raw_json_response(body, 200)
+    return response
 
 
 @app.delete("/api/regions/{region_id}", response_model=RevisionOut, tags=["regions"])
-def remove_region(region_id: int = Path(ge=1)):
+def remove_region(region_id: int = Path(ge=1),
+                  idempotency_key: str | None = Header(
+                      default=None,
+                      description="幂等键：非空、最长 128 字符；"
+                                  "同键同内容重试返回原响应，同键不同内容 409",
+                  )):
+    """删除区域并推进全局 revision；不存在的区域返回 404。
+
+    携带 `Idempotency-Key` 时，同键重试返回首次删除的原响应（200），
+    不会因区域已不存在而变成 404，revision 也不会再次推进。
+    """
+    key = _normalize_idempotency_key(idempotency_key)
+    fingerprint = (
+        _request_fingerprint("delete", region_id, None)
+        if key is not None else None
+    )
     with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
         with conn.cursor() as cur:
             repository.configure_cursor(cur)
-            deleted, revision = repository.delete_region(cur, region_id)
-            if not deleted:
-                raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
-                                                                       "message": f"区域 {region_id} 不存在"}})
-        conn.commit()
-    return RevisionOut(revision=revision)
+            try:
+                if key is not None:
+                    replay = repository.idempotency_claim(cur, key, fingerprint)
+                    if replay is not None:
+                        conn.rollback()  # 只读回放，不产生任何变更
+                        return _raw_json_response(replay["response_body"],
+                                                  replay["status_code"])
+                deleted, revision = repository.delete_region(cur, region_id)
+                if not deleted:
+                    conn.rollback()
+                    raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                                           "message": f"区域 {region_id} 不存在"}})
+                response = RevisionOut(revision=revision)
+                if key is not None:
+                    body = response.model_dump_json()
+                    repository.idempotency_store(cur, key, 200, body)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    if key is not None:
+        return _raw_json_response(body, 200)
+    return response
 
 
 @app.get("/api/revision", response_model=RevisionOut, tags=["regions"])
@@ -373,7 +549,12 @@ def current_revision():
               404: {"description": "批内引用了不存在的区域（region_not_found）"},
           },
           tags=["regions"])
-def batch_change_regions(payload: RegionBatchRequest):
+def batch_change_regions(payload: RegionBatchRequest,
+                         idempotency_key: str | None = Header(
+                             default=None,
+                             description="幂等键：非空、最长 128 字符；"
+                                         "同键同内容重试返回原响应，同键不同内容 409",
+                         )):
     """把多处区域登记/修订/删除作为**一次原子变更**提交，并保证指定轨迹在
     变更后的完整区域集合下仍然安全。
 
@@ -400,38 +581,59 @@ def batch_change_regions(payload: RegionBatchRequest):
 
     并发区域变更（含单个登记/修订/删除）与凭证签发/取消因同一把 meta 行锁
     在此串行化，无法绕过 revision 比对、轨迹核验与凭证约束检查。
+
+    携带 `Idempotency-Key` 请求头时启用幂等重试：首次成功提交后，相同键 +
+    相同请求内容的重试直接返回原状态与原响应（即使期间 revision 已被其它
+    变更推进），整批不会再次落库，也不会重新分配区域 ID。
     """
+    key = _normalize_idempotency_key(idempotency_key)
     # 轨迹合法性（点数、有限坐标、时刻严格递增）在几何层统一报错
     trajectories = [
         geometry.validate_trajectory(points, lambda p: p.t)
         for points in payload.trajectories
     ]
+    fingerprint = (
+        _request_fingerprint("batch", None, payload.model_dump(mode="json"))
+        if key is not None else None
+    )
 
     with db.pool.connection() as conn:
         conn.rollback()  # 确保从连接池拿到的连接没有残留事务
         with conn.cursor() as cur:
             repository.configure_cursor(cur)
             try:
+                if key is not None:
+                    replay = repository.idempotency_claim(cur, key, fingerprint)
+                    if replay is not None:
+                        conn.rollback()  # 只读回放，不产生任何变更
+                        return _raw_json_response(replay["response_body"],
+                                                  replay["status_code"])
                 result = repository.apply_batch(cur, payload, trajectories)
+                out_trajectories = []
+                for check in result["trajectory_results"]:
+                    out_trajectories.append({
+                        "index": check["index"],
+                        "safe": check["safe"],
+                        "results": _crossings_to_out(check["results"]),
+                    })
+                response = RegionBatchResponse(
+                    revision=result["revision"],
+                    operations=result["operations"],
+                    trajectories=out_trajectories,
+                )
+                if key is not None:
+                    # 响应原文与整批变更同事务落库；此后同键重试只回放、不再变更
+                    body = response.model_dump_json()
+                    repository.idempotency_store(cur, key, 200, body)
             except Exception:
                 conn.rollback()
                 raise
             else:
                 conn.commit()
 
-    out_trajectories = []
-    for check in result["trajectory_results"]:
-        out_trajectories.append({
-            "index": check["index"],
-            "safe": check["safe"],
-            "results": _crossings_to_out(check["results"]),
-        })
-
-    return RegionBatchResponse(
-        revision=result["revision"],
-        operations=result["operations"],
-        trajectories=out_trajectories,
-    )
+    if key is not None:
+        return _raw_json_response(body, 200)
+    return response
 
 
 # ---------------------------------------------------------------- 通行凭证

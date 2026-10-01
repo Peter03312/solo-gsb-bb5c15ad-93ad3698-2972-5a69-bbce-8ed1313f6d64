@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS passes (
 
 CREATE INDEX IF NOT EXISTS idx_passes_constraining
     ON passes (status, end_time);
+
+-- 幂等键：区域写操作（登记/修订/删除/批量变更）的网络超时安全重试。
+-- 占位行与业务变更、响应回填在同一事务提交，因此已提交的行必然带有
+-- 完整的原 HTTP 状态码与响应体；业务失败回滚时占位行一并消失（不占键）
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key           TEXT PRIMARY KEY,
+    -- 操作类型 + 目标区域 + 规范化请求内容的 SHA-256，用于判定是否同一次请求
+    fingerprint   TEXT NOT NULL,
+    status_code   INTEGER,
+    -- 首次成功提交的原响应体（JSON 原文），重试时逐字节回放
+    response_body TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 

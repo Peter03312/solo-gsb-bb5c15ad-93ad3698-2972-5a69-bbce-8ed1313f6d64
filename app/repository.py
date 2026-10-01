@@ -84,6 +84,14 @@ class PassConflict(Exception):
         self.pass_ids = pass_ids
 
 
+class IdempotencyKeyConflict(Exception):
+    """同一幂等键被内容不同的请求复用（操作类型/目标区域/请求内容不一致）。"""
+
+    def __init__(self, key: str):
+        super().__init__("幂等键已被另一份内容不同的请求占用，本次不变更任何数据")
+        self.key = key
+
+
 def _row_to_region(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -310,6 +318,58 @@ def load_snapshot(cur) -> tuple[int, list[dict]]:
 
 def configure_cursor(cur) -> None:
     cur.row_factory = dict_row
+
+
+# ---------------------------------------------------------------- 幂等键
+
+def idempotency_claim(cur, key: str, fingerprint: str) -> dict | None:
+    """在写事务内占用幂等键（与后续业务变更同一事务）。
+
+    返回 None：本事务成功占位，调用方应继续执行业务操作，并在成功时
+    idempotency_store 回填响应；业务失败回滚则占位行一并消失（不占键）。
+    返回 dict（含 status_code/response_body）：同键同内容的请求已成功
+    提交过，调用方应直接回放原状态与原响应，不再执行任何变更。
+    同键但内容不同：抛 IdempotencyKeyConflict，调用方回滚，不变更任何数据。
+
+    并发同键请求在主键上互斥：后到的 INSERT 会等待先到的提交或回滚，
+    因此同一键全库只会有一次实际提交。
+    """
+    cur.execute(
+        """
+        INSERT INTO idempotency_keys (key, fingerprint)
+        VALUES (%s, %s)
+        ON CONFLICT (key) DO NOTHING
+        RETURNING key
+        """,
+        (key, fingerprint),
+    )
+    if cur.fetchone() is not None:
+        return None
+    # 键已被占用：占位行与响应回填在同一事务提交，这里读到的必然是完整记录
+    cur.execute(
+        """
+        SELECT fingerprint, status_code, response_body
+        FROM idempotency_keys WHERE key = %s
+        """,
+        (key,),
+    )
+    row = cur.fetchone()
+    if row["fingerprint"] != fingerprint:
+        raise IdempotencyKeyConflict(key)
+    return row
+
+
+def idempotency_store(cur, key: str, status_code: int, response_body: str) -> None:
+    """把首次成功提交的原 HTTP 状态码与响应体（JSON 原文）写回占位行
+    （与业务变更同事务）。"""
+    cur.execute(
+        """
+        UPDATE idempotency_keys
+        SET status_code = %s, response_body = %s
+        WHERE key = %s
+        """,
+        (status_code, response_body, key),
+    )
 
 
 # ---------------------------------------------------------------- 批量原子变更
