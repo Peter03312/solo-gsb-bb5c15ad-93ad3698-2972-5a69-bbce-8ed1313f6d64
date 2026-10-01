@@ -7,6 +7,8 @@
 出发时段内，精确求出所有不会触碰限行区的出发区间。此外，安全员可以为指定
 通行轨迹**签发可取消的通行凭证**：未取消且行程未结束的凭证会约束后续一切
 区域变更，任何会使其轨迹不再安全的登记/修订/删除/批量变更都会被整体拒绝。
+区域写操作（登记/修订/删除/批量变更）支持携带 `Idempotency-Key` 幂等键：
+网络超时后的相同请求重试返回首次提交的原状态与原响应，不会重复变更。
 
 ## 核验规则
 
@@ -33,7 +35,6 @@
 
 安全员可以把**多处**限行区域的登记/修订/删除放在**一次变更**里提交，并要求
 一条或多条指定通行轨迹在变更后的完整区域集合下仍然安全：
-
 * **请求**：`expected_revision`（预期全局 revision）、`operations`（非空，
   元素为 `create` / `update` / `delete`，按数组顺序执行）、`trajectories`
   （至少 1 条带时区绝对时刻轨迹，结构与 `/api/verify` 相同；每条 ≥2 点、
@@ -62,6 +63,70 @@
 | 422 | `unsafe_trajectory` | 存在轨迹在变更后集合下穿越；details 列出轨迹下标与穿越起止明细 |
 | 409 | `pass_conflict` | 变更后集合将使未取消且未结束的凭证不安全；details 列出冲突凭证 id |
 | 422 | `validation_error` / `invalid_polygon` / `invalid_trajectory` | 结构/多边形/轨迹非法（同既有接口） |
+
+## 幂等重试（`Idempotency-Key`）
+
+安全员在**网络超时后重试区域变更**时，可以为以下写操作携带幂等键
+（`Idempotency-Key` 请求头）：
+
+* `POST /api/regions`（登记）
+* `PATCH /api/regions/{id}`（修订）
+* `DELETE /api/regions/{id}`（删除）
+* `POST /api/regions/batch`（批量原子变更）
+
+规则：
+
+* **键的要求**：非空（全空白视为空）、最长 128 字符；非法键返回
+  **422** `invalid_idempotency_key`，不执行任何变更。
+* **键全局唯一**：同一键在上述四类写操作间共享命名空间；是否**同一次请求**
+  由「操作类型 + 目标区域 + 规范化请求内容」判定。请求内容在服务端校验
+  归一化后参与判定（时刻归一化为 UTC、多边形归一化为逆时针闭合环、未显式
+  提交的字段不参与），因此时区写法、JSON 键序、多边形是否显式闭合等表层
+  差异不影响判定。
+* **首次成功提交**：变更结果与键、原 HTTP 状态、原响应体在**同一事务**内
+  落库——键与业务变更要么一起生效，要么一起回滚。
+* **相同请求重试**：即使区域 `revision` 已经变化（包括批量请求的
+  `expected_revision` 已过期），也返回**原状态与原响应**（逐字节一致，
+  响应头带 `Idempotency-Replayed: true`），不会再次推进
+  `revision`/`version`，不会重复登记区域或重新分配区域 ID；
+  已删除的区域重试删除仍返回 200 而不会变成 404。
+* **并发同键**：并发提交的相同请求在全局元数据行锁上串行化，只有
+  **一次实际提交**，其余请求在锁释放后读到已落库的结果并整体重放。
+* **同键不同请求**：返回 **409** `idempotency_conflict`，不执行任何变更
+  （包括同键但目标区域不同、同键跨操作类型）。
+* **失败的业务请求不占键**：业务校验失败（如 422 非法输入、404 区域不存在、
+  409 `revision_conflict`/`pass_conflict`）不会占用键，修正请求后可用
+  同一键重新提交。
+* **无键请求**：不携带该头的请求保持既有行为，重复提交即重复执行。
+* 区域变更对有效凭证的保护（409 `pass_conflict`）、批量原子性及既有错误
+  契约在带键请求上同样适用。
+
+示例（登记后原样重试）：
+
+```bash
+# 首次提交：201，返回新区域与推进后的 revision
+curl -X POST http://localhost:8000/api/regions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7f3c9e2a-weld-area-2026-09' \
+  -d '{
+        "name": "A区-焊接作业面",
+        "polygon": [[0,0],[100,0],[100,100],[0,100]],
+        "valid_from": "2026-09-01T00:00:00Z",
+        "valid_to":   "2026-10-01T00:00:00Z"
+      }'
+
+# 网络超时后原样重试（同键同请求）：仍 201，逐字节返回首次响应，
+# 响应头 Idempotency-Replayed: true；区域不重复登记、revision 不再推进
+curl -X POST http://localhost:8000/api/regions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 7f3c9e2a-weld-area-2026-09' \
+  -d '{
+        "name": "A区-焊接作业面",
+        "polygon": [[0,0],[100,0],[100,100],[0,100]],
+        "valid_from": "2026-09-01T00:00:00Z",
+        "valid_to":   "2026-10-01T00:00:00Z"
+      }'
+```
 
 ## 通行凭证规则（签发 / 查询 / 取消）
 
@@ -138,7 +203,8 @@ docker compose up --build
 | http://localhost:8000/health | 健康检查 |
 | PostgreSQL | localhost:5432（用户/库/密码均为 restrict） |
 
-首次启动时应用会自动建表（`regions`、`region_meta`、`passes`）并初始化全局版本号，
+首次启动时应用会自动建表（`regions`、`region_meta`、`passes`、
+`idempotency_keys`）并初始化全局版本号，
 无需手工执行 SQL。数据库未就绪时应用会自动重试连接（默认 30 次、间隔 1 秒）。
 
 停止并清理数据卷：
@@ -189,6 +255,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/passes` | 为一条绝对时刻轨迹签发可取消的通行凭证（201） |
 | GET | `/api/passes/{id}` | 按 ID 查询凭证（含状态） |
 | POST | `/api/passes/{id}/cancel` | 取消凭证（幂等），返回状态 |
+
+四个区域写操作（登记/修订/删除/批量变更）均可携带 `Idempotency-Key`
+请求头实现幂等重试，详见「幂等重试」一节。
 
 登记示例：
 
@@ -489,14 +558,16 @@ curl -X POST http://localhost:8000/api/passes/1/cancel   # 取消，幂等
 ### 错误响应
 
 统一使用 `422`（语义错误）、`404`（区域/凭证不存在）或 `409`（批量提交的
-revision 冲突、区域变更与未取消凭证冲突）。除通用的 `validation_error` 外，
+revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。除通用的 `validation_error` 外，
 轨迹类错误使用专用错误码：`/api/verify` 与 `/api/passes` 为
 `invalid_trajectory`，`/api/schedule` 的相对轨迹问题同样返回
 `invalid_trajectory`，候选时段不递增返回 `invalid_input`；
 `/api/regions/batch` 另用 `revision_conflict`（409）、`region_not_found`（404）、
 `duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）；
 凭证相关另用 `pass_conflict`（409，区域变更危及未取消凭证）与
-`not_found`（404，未知凭证 ID）：
+`not_found`（404，未知凭证 ID）；幂等重试相关另用
+`invalid_idempotency_key`（422，键为空/全空白/超过 128 字符）与
+`idempotency_conflict`（409，同一键承载了不同的请求）：
 
 ```json
 {
@@ -522,6 +593,10 @@ bash examples/curl_batch.sh
 # 不安全与已开始轨迹拒签）
 bash examples/curl_passes.sh
 
+# 幂等重试（Idempotency-Key：登记/修订/删除/批量变更的重试重放、
+# 同键冲突、非法键、失败不占键）
+bash examples/curl_idempotency.sh
+
 # 仅用 Python 标准库的调用示例（含调度两段安全区间与通行凭证演示）
 python3 examples/python_client.py
 ```
@@ -546,6 +621,10 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 通行凭证 API 集成测试（签发/查询/取消、凭证约束区域变更、过期放行、
 # 签发与区域写入并发串行化，会清空 regions/passes 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_passes_api.py
+
+# 幂等键 API 集成测试（重试重放原响应、同键冲突、非法键、失败不占键、
+# 并发同键仅一次提交，会清空 regions/passes/idempotency_keys 表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_idempotency_api.py
 ```
 
 ## 项目结构
@@ -556,7 +635,7 @@ app/
   schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合）
   geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
   repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证签发/取消
-  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes）、启动重试
+  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/idempotency_keys）、启动重试
 examples/        # curl 与 Python 调用示例（含批量原子变更与通行凭证）
 tests/           # 几何离线测试与 API/批量变更/通行凭证集成测试
 Dockerfile, docker-compose.yml

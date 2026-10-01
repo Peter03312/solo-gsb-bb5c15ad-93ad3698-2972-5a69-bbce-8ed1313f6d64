@@ -69,6 +69,24 @@ CREATE TABLE IF NOT EXISTS passes (
 
 CREATE INDEX IF NOT EXISTS idx_passes_constraining
     ON passes (status, end_time);
+
+-- 幂等键：安全员在网络超时后重试区域写操作（登记/修订/删除/批量变更）时携带。
+-- 首次成功提交时，键与原 HTTP 状态、响应体原文随业务变更在同一事务内落库；
+-- 相同请求的重试直接重放该记录，不再推进 revision/version 或分配区域 ID。
+-- 是否同一次请求由（operation, target, request_hash）判定。
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    key             TEXT PRIMARY KEY,
+    -- 操作类型：create / update / delete / batch
+    operation       TEXT NOT NULL,
+    -- 目标区域 id（update/delete）；create/batch 为空串
+    target          TEXT NOT NULL DEFAULT '',
+    -- 规范化请求内容的 SHA-256（十六进制）
+    request_hash    TEXT NOT NULL,
+    status_code     INTEGER NOT NULL,
+    -- 首次成功响应体的原文（JSON 文本），重放时逐字节返回
+    response_body   TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 

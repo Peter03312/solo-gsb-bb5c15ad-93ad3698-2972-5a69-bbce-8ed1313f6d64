@@ -84,6 +84,16 @@ class PassConflict(Exception):
         self.pass_ids = pass_ids
 
 
+class IdempotencyConflict(Exception):
+    """同一幂等键被用于另一笔不同的请求（操作类型/目标区域/请求内容不一致）。"""
+
+    def __init__(self, key: str):
+        super().__init__(
+            f"幂等键 {key!r} 已用于一笔不同的请求；同一键只能重放完全相同的请求"
+        )
+        self.key = key
+
+
 def _row_to_region(row: dict) -> dict:
     return {
         "id": row["id"],
@@ -310,6 +320,46 @@ def load_snapshot(cur) -> tuple[int, list[dict]]:
 
 def configure_cursor(cur) -> None:
     cur.row_factory = dict_row
+
+
+# ---------------------------------------------------------------- 幂等键
+
+def lookup_idempotency(cur, key: str) -> dict | None:
+    """按主键查询幂等记录（调用方应已持有 region_meta 行锁，保证读到已提交结果）。"""
+    cur.execute(
+        """
+        SELECT key, operation, target, request_hash, status_code, response_body
+        FROM idempotency_keys
+        WHERE key = %s
+        """,
+        (key,),
+    )
+    return cur.fetchone()
+
+
+def save_idempotency(cur, key: str, operation: str, target: str,
+                     request_hash: str, status_code: int,
+                     response_body: str) -> None:
+    """把首次成功提交的结果与幂等键一起落库（与业务变更在同一事务内）。
+
+    response_body 为首次响应体的 JSON 原文，重放时逐字节返回。
+    """
+    cur.execute(
+        """
+        INSERT INTO idempotency_keys
+            (key, operation, target, request_hash, status_code, response_body)
+        VALUES (%(key)s, %(operation)s, %(target)s, %(request_hash)s,
+                %(status_code)s, %(response_body)s)
+        """,
+        {
+            "key": key,
+            "operation": operation,
+            "target": target,
+            "request_hash": request_hash,
+            "status_code": status_code,
+            "response_body": response_body,
+        },
+    )
 
 
 # ---------------------------------------------------------------- 批量原子变更
